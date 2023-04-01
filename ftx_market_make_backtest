@@ -1,0 +1,631 @@
+import time
+import datetime
+import ccxt as ccxt
+import numpy as np
+import math
+import pickle
+import pandas as pd
+import matplotlib.pyplot as plt
+import copy
+
+ftx = ccxt.ftx()
+symbol = "ETH-PERP"
+fr_date = "2021-06-05"
+to_date = "2021-06-05"
+
+# インデックス取得から買い発注反映されるまでのレイテンシー
+t1 = 1
+# 買い発注反映からキャンセルまでのレイテンシー
+t2 = 10
+# 買い発注キャンセルから売り発注反映までのレイテンシー
+t3 = 1
+# # 売り発注反映からキャンセルまでの休眠時間
+t4 = 10
+# 売り発注キャンセルから（1回目の）ミッドヘッジ完了までのレイテンシー:キャンセル、資産残高取得、ミッド計算(実所要時間要検討)
+# 成り行きの場合、ミッド計算はないので２秒になる
+t5 = 5
+# 売り発注約定またはミッドヘッジ完了から、インデックス取得直前までのレイテンシー
+t6 = 3
+
+df_exe = pd.read_csv("executions_{0}_{1}.csv".format(symbol, fr_date), index_col = 0)
+tmp_date = fr_date
+# need to modify the code so that the code can handle data leaping months
+for i in range(int(to_date.split("-")[2]) - int(fr_date.split("-")[2])):
+    if int(tmp_date.split("-")[2]) < 10:
+        tmp_date = tmp_date.split("-")[0]+"-"+tmp_date.split("-")[1]+"-"+"0"+str(int(tmp_date.split("-")[2])+1)
+        print(tmp_date)
+    elif int(tmp_date.split("-")[2]) >= 10:
+        tmp_date = tmp_date.split("-")[0]+"-"+tmp_date.split("-")[1]+"-"+str(int(tmp_date.split("-")[2])+1)
+        print(tmp_date)
+    df_exe = pd.concat([df_exe, pd.read_csv("executions_{0}_{1}.csv".format(symbol, tmp_date), index_col = 0)]).reset_index(drop = True)
+
+df_exe["ts"] = df_exe["time"].apply(lambda x : x[:26]).apply(lambda x : datetime.datetime.strptime(x, '%Y-%m-%dT%H:%M:%S.%f')).apply(lambda x : x.timestamp())
+# format standardization process(to convert format of FTX to Liquid)
+df_exe = df_exe.drop(["liquidation", "time"], axis = 1)
+df_exe = df_exe.rename(columns = {"size":"quantity", "side":"taker_side"})
+df_exe = df_exe.reindex(columns = ["ts", "id", "price", "quantity", "taker_side"])
+# omit milliseconds
+df_exe["ts"] = df_exe["ts"].apply(lambda x : int(x))
+
+# check data type
+for c in df_exe.columns:
+    print(c)
+    print(df_exe.loc[0, c])
+    print(type(df_exe.loc[0, c]))
+    print("-"*20)
+
+plt.plot(df_exe["price"])
+
+exe = df_exe.values
+drop_list = list()
+for i in range(len(exe)):
+    if isinstance(exe[i][2], str) == True:
+        print("str type price detected")
+        drop_list.append(i)
+df_exe = df_exe.drop(drop_list)
+
+df_buy = df_exe[df_exe["taker_side"] == "buy"]
+df_sell = df_exe[df_exe["taker_side"] == "sell"]
+
+df_buy_best = df_buy.groupby(["ts"]).apply(lambda x : np.nanmax(x.values[:,2]))
+df_buy_best = pd.DataFrame([df_buy_best.index, df_buy_best]).T
+columns = ["ts", "buy_best_price"]
+df_buy_best.columns = columns
+
+df_sell_best = df_sell.groupby(["ts"]).apply(lambda x : np.nanmin(x.values[:,2]))
+df_sell_best = pd.DataFrame([df_sell_best.index, df_sell_best]).T
+columns = ["ts", "sell_best_price"]
+df_sell_best.columns = columns
+
+df_buy_vwap = df_buy.groupby(["ts"]).apply(lambda x : np.average(a = x.values[:,2], weights = x.values[:,3]))
+df_buy_vwap = pd.DataFrame([df_buy_vwap.index, df_buy_vwap]).T
+columns = ["ts", "buy_vwap"]
+df_buy_vwap.columns = columns
+
+df_sell_vwap = df_sell.groupby(["ts"]).apply(lambda x : np.average(a = x.values[:,2], weights = x.values[:,3]))
+df_sell_vwap = pd.DataFrame([df_sell_vwap.index, df_sell_vwap]).T
+columns = ["ts", "sell_vwap"]
+df_sell_vwap.columns = columns
+
+df_vwap = pd.merge(df_buy_vwap, df_sell_vwap, how = "outer")
+df_best = pd.merge(df_buy_best, df_sell_best, how = "outer")
+df_prices = pd.merge(df_best, df_vwap, how = "outer")
+
+ts = df_prices["ts"].values
+ts_list = list(range(int(ts[0]), int(ts[len(ts)-1]+1)))
+# need to sort values by ts with ascending order to analyzse historical trades
+df_prices = pd.merge(pd.DataFrame(ts_list).rename(columns = {0:"ts"}), df_prices, how = "outer").sort_values(by = "ts", ascending = True).reset_index(drop = True)
+
+df_prices["referred_buy_best_price"] = np.nan
+df_prices["referred_sell_best_price"] = np.nan
+df_prices["referred_buy_vwap"] = np.nan
+df_prices["referred_sell_vwap"] = np.nan
+df_prices["smart_exit"] = False
+df_prices["mid_exit"] = False
+df_prices["pl"] = np.nan
+df_prices["buy_entry_price"] = np.nan
+df_prices["sell_entry_price"] = np.nan
+
+# 約定アマウントを考慮する際に利用する
+columns = df_sell.columns
+column_n_dict_sell = dict()
+for i in range(len(columns)):
+    column_n_dict_sell[columns[i]] = i
+sell = df_sell.values
+columns = df_sell.columns
+
+columns = df_buy.columns
+column_n_dict_buy = dict()
+for i in range(len(columns)):
+    column_n_dict_buy[columns[i]] = i
+buy = df_buy.values
+
+columns = df_prices.columns
+column_n_dict = dict()
+for i in range(len(columns)):
+    column_n_dict[columns[i]] = i
+
+prices = df_prices.values
+
+# ri stands for refered index
+# index取得から、実際の発注が起こる時間までのlatency(t1)を考慮して、発注時に参照されたindexを得る
+index_list = ["buy_best_price", "sell_best_price"]
+referred_index_list = ["referred_" + i for i in index_list]
+for index in index_list:
+    print(index)
+    for i in range(len(prices)):
+        ri = np.nan
+        if i+1-t1 >= 1:
+            for j in range(i-t1+1):
+                if math.isnan(prices[i-t1-j, column_n_dict[index]]) == False:
+                    ri = prices[i-t1-j, column_n_dict[index]]
+                    break
+        prices[i, column_n_dict["referred_{}".format(index)]] = ri
+df_prices = pd.DataFrame(prices)
+df_prices.columns = columns
+
+# 例えば、一行目のdataだと、その前のインデックスがないので、refered index == np.nanとなる。このようなケースを排除する
+df_prices = df_prices.dropna(subset = referred_index_list).reset_index(drop = True)
+end_index = len(df_prices)-1
+score = 0
+trial = 0
+
+bld = -10
+sld = 10
+bld_exit = -4.5
+sld_exit = 4.5
+t1 = 1
+t2 = 65
+t3 = 1
+t4 = 600
+t5 = 1
+t6 = 1
+long_entry = True
+short_entry = True
+order_amount = 0.001
+df_prices["pl"] = np.nan
+prices = df_prices.values
+start_index = 0
+loss_cut = True
+mid_exit_mode = True
+vwap_all_nan = True
+mid_exit = False
+mid_exit_cost = 2500*0.07/100
+
+print("ready")
+
+while start_index+t2+t3+t4 <= end_index:
+    # print("initialization")
+    # print("start_index : {}".format(start_index))
+
+    # initialization
+    buy_entried_amount = 0
+    sell_entried_amount = 0
+    long_exit = False
+    short_exit = False
+    mid_exit = False
+    vwap_all_nan = True
+
+    # you define values used for simulation first(for good visibility, you define all values sacrificing speed without taking accout in if you long entry or short entry)
+    buy_entry_price = prices[start_index, column_n_dict["referred_sell_best_price"]] + bld
+    sell_entry_price = prices[start_index, column_n_dict["referred_buy_best_price"]] + sld
+    # print("bep : {}".format(buy_entry_price))
+    # print("sep : {}".format(sell_entry_price))
+    try:
+        future_min_sell_price_entry = np.nanmin(prices[:,column_n_dict["sell_best_price"]][start_index:start_index+t2+1])
+    except:
+        future_min_sell_price_entry = np.nan
+    # print("fminspent : {}".format(future_min_sell_price_entry))
+    try:
+        future_max_buy_price_entry = np.nanmax(prices[:,column_n_dict["buy_best_price"]][start_index:start_index+t2+1])
+    except:
+        future_max_buy_price_entry = np.nan
+    # print("fmaxbpent : {}".format(future_max_buy_price_entry))
+    # you buy_entry_price is equal to future_min_sell_price_entry, you cannot discern if your buy entry order is filled or just there there are othre traders' trades done at your entry price
+    if buy_entry_price > future_min_sell_price_entry:
+        # print("buy entried")
+        a = sell[:,column_n_dict_sell["ts"]] >= prices[start_index, column_n_dict["ts"]]
+        b = sell[:,column_n_dict_sell["ts"]] <= prices[start_index+t2, column_n_dict["ts"]]
+        sell_scope = sell[a==b]
+        # エントリー可能量と、自分のオーダーアマウントの内、小さい方が実際のエントリー量
+        buy_entried_amount = min(sell_scope[sell_scope[:,column_n_dict_sell["price"]] < buy_entry_price][:,column_n_dict_sell["quantity"]].sum(), order_amount)
+    if sell_entry_price < future_max_buy_price_entry:
+        # print("sell entried")
+        a = buy[:,column_n_dict_sell["ts"]] >= prices[start_index, column_n_dict["ts"]]
+        b = buy[:,column_n_dict_sell["ts"]] <= prices[start_index+t2, column_n_dict["ts"]]
+        buy_scope = buy[a==b]
+        sell_entried_amount = min(buy_scope[buy_scope[:,column_n_dict_sell["price"]] > sell_entry_price][:,column_n_dict_sell["quantity"]].sum(), order_amount)
+    if long_entry == True and short_entry == True and (buy_entried_amount > 0 or sell_entried_amount > 0):
+        # there could be a case that both your buy_entry and sell_entry is filled during t2  and you have to consider that case
+        # print("long entry and short entry")
+        if buy_entried_amount - sell_entried_amount > 0:
+            if sell_entried_amount != 0:
+                prices[start_index, column_n_dict["pl"]] = sell_entried_amount*(sell_entry_price - buy_entry_price)
+            buy_entried_amount = buy_entried_amount - sell_entried_amount
+            long_exit = True
+            # print("long entried")
+        elif buy_entried_amount - sell_entried_amount < 0:
+            if buy_entried_amount != 0:
+                prices[start_index, column_n_dict["pl"]] = buy_entried_amount*(sell_entry_price - buy_entry_price)
+            sell_entried_amount = abs(buy_entried_amount - sell_entried_amount)
+            short_exit = True
+            # print("short entried")
+        elif buy_entried_amount - sell_entried_amount == 0:
+            prices[start_index, column_n_dict["pl"]] = buy_entried_amount*(sell_entry_price-buy_entry_price)
+            # in this case, exit phase does not exist
+            # print("position all settled on entry")
+    elif long_entry == True and short_entry == False and buy_entried_amount > 0:
+        # print("long entried")
+        long_exit = True
+    elif long_entry == False and short_entry == True and sell_entried_amount > 0:
+        # print("short entried")
+        short_exit = True
+    elif long_entry == False and short_entry == False:
+        pass
+        # print("please specify direction of entry for either long or short")
+    else:
+        pass
+        # print("no entry is filled")
+
+    if long_exit == True:
+        print("will long exit")
+        long_exit_price = buy_entry_price + sld_exit
+        print("lep : {}".format(long_exit_price))
+        try:
+            future_max_buy_price_exit = np.nanmax(prices[:,column_n_dict["buy_best_price"]][start_index+t2+t3:start_index+t2+t3+t4+1])
+        except:
+            future_max_buy_price_exit = np.nan
+        print("fmaxbpexi : {}".format(future_max_buy_price_exit))
+        if long_exit_price < future_max_buy_price_exit:
+            print("exited")
+            a = buy[:,column_n_dict_sell["ts"]] >= prices[start_index+t2+t3, column_n_dict["ts"]]
+            b = buy[:,column_n_dict_sell["ts"]] <= prices[start_index+t2+t3+t4, column_n_dict["ts"]]
+            buy_scope = buy[a==b]
+            exitable_amount = buy_scope[buy_scope[:,column_n_dict_buy["price"]] > long_exit_price][:,column_n_dict_buy["quantity"]].sum()
+            print("exitable_amount : {}".format(exitable_amount))
+            if exitable_amount >= buy_entried_amount:
+                print("exited all")
+                # you exit all
+                prices[start_index, column_n_dict["pl"]] = buy_entried_amount*(long_exit_price-buy_entry_price)
+                start_index += t2+t3+t4+t6
+                print("start_index : {}".format(start_index))
+            elif exitable_amount < buy_entried_amount:
+                print("partial exit")
+                # you put limit exit order till your position is settled
+                prices[start_index, column_n_dict["pl"]] = exitable_amount*(long_exit_price-buy_entry_price)
+                buy_entried_amount = buy_entried_amount - exitable_amount
+                start_index += t2+t3+t4
+                print("start_index : {}".format(start_index))
+
+                if mid_exit_mode == False:
+
+                    while start_index+t3+t4 <= end_index:
+                        # use this price as index for exit though this is not index used for entry price, but refreshed index
+                        long_exit_price = prices[start_index, column_n_dict["referred_sell_best_price"]] + sld_exit
+                        # to get away with loss cut
+                        if loss_cut == False:
+                            long_exit_price = max(long_exit_price, buy_entry_price + sld_exit)
+                        print("re entried")
+                        print("lep : {}".format(long_exit_price))
+                        try:
+                            future_max_buy_price_exit = np.nanmax(prices[:,column_n_dict["buy_best_price"]][start_index+t3:start_index+t3+t4+1])
+                        except:
+                            future_max_buy_price_exit = np.nan
+                        print("fmaxbpexi : {}".format(future_max_buy_price_exit))
+                        if long_exit_price < future_max_buy_price_exit:
+                            print("exited with refreshed index")
+                            a = buy[:,column_n_dict_sell["ts"]] >= prices[start_index+t3, column_n_dict["ts"]]
+                            b = buy[:,column_n_dict_sell["ts"]] <= prices[start_index+t3+t4, column_n_dict["ts"]]
+                            buy_scope = buy[a==b]
+                            exitable_amount = buy_scope[buy_scope[:,column_n_dict_buy["price"]] > long_exit_price][:,column_n_dict_buy["quantity"]].sum()
+                            if exitable_amount >= buy_entried_amount:
+                                print("exited all")
+                                # you exit all
+                                prices[start_index, column_n_dict["pl"]] = buy_entried_amount*(long_exit_price-buy_entry_price)
+                                start_index += t3+t4+t6
+                                print("start_index : {}".format(start_index))
+                                print("breaked")
+                                break
+                            elif exitable_amount < buy_entried_amount:
+                                print("partial exit")
+                                # you put limit exit order till your position is settled
+                                prices[start_index, column_n_dict["pl"]] = exitable_amount*(long_exit_price-buy_entry_price)
+                                buy_entried_amount = buy_entried_amount - exitable_amount
+                                start_index += t3+t4
+                                print("start_index : {}".format(start_index))
+                                continue
+                        elif long_exit_price >= future_max_buy_price_exit:
+                            print("no exit")
+                            start_index += t3+t4
+                            print("start_index : {}".format(start_index))
+                            continue
+                        else:
+                            # you get here if there is no buy trades done while you wait to be filled and future_max_buy_price_exit is np.nan
+                            print("else and no exit")
+                            start_index += t3+t4
+                            print("start_index : {}".format(start_index))
+                            continue
+
+                elif mid_exit_mode == True:
+                    # partially filled
+                    mid_exit = True
+
+        elif long_exit_price >= future_max_buy_price_exit:
+            print("no exit")
+            start_index += t2+t3+t4
+            print("start_index : {}".format(start_index))
+
+            if mid_exit_mode == False:
+
+                while start_index+t3+t4 <= end_index:
+                    # use this price as index for exit though this is not real entry price
+                    long_exit_price = prices[start_index, column_n_dict["referred_sell_best_price"]] + sld_exit
+                    # to get away with loss cut
+                    if loss_cut == False:
+                        long_exit_price = max(long_exit_price, buy_entry_price + sld_exit)
+                    print("re entried")
+                    print("lep : {}".format(long_exit_price))
+                    try:
+                        future_max_buy_price_exit = np.nanmax(prices[:,column_n_dict["buy_best_price"]][start_index+t3:start_index+t3+t4+1])
+                    except:
+                        future_max_buy_price_exit = np.nan
+                    print("fmaxbpexi : {}".format(future_max_buy_price_exit))
+                    if long_exit_price < future_max_buy_price_exit:
+                        print("exited")
+                        a = buy[:,column_n_dict_sell["ts"]] >= prices[start_index+t3, column_n_dict["ts"]]
+                        b = buy[:,column_n_dict_sell["ts"]] <= prices[start_index+t3+t4, column_n_dict["ts"]]
+                        buy_scope = buy[a==b]
+                        exitable_amount = buy_scope[buy_scope[:,column_n_dict_buy["price"]] > long_exit_price][:,column_n_dict_buy["quantity"]].sum()
+                        if exitable_amount >= buy_entried_amount:
+                            print("exited all")
+                            # you exit all
+                            prices[start_index, column_n_dict["pl"]] = buy_entried_amount*(long_exit_price-buy_entry_price)
+                            start_index += t3+t4+t6
+                            print("start_index : {}".format(start_index))
+                            print("breaked")
+                            break
+                        elif exitable_amount < buy_entried_amount:
+                            print("partial exit")
+                            # you put limit exit order till your position is settled
+                            prices[start_index, column_n_dict["pl"]] = exitable_amount*(long_exit_price-buy_entry_price)
+                            buy_entried_amount = buy_entried_amount - exitable_amount
+                            start_index += t3+t4
+                            print("start_index : {}".format(start_index))
+                    elif long_exit_price >= future_max_buy_price_exit:
+                        print("no exit")
+                        start_index += t3+t4
+                        print("start_index : {}".format(start_index))
+                    else:
+                        print("else and no exit")
+                        start_index += t3+t4
+                        print("start_index : {}".format(start_index))
+
+            elif mid_exit_mode == True:
+                # there are trades done but did not reach exit level
+                mid_exit = True
+
+        else:
+            # you get here if there is no buy trades done while you wait to be filled and future_max_buy_price_exit is np.nan
+            if mid_exit_mode == False:
+
+                print("else and no exit")
+                start_index += t2+t3+t4
+                print("start_index : {}".format(start_index))
+
+            elif mid_exit_mode == True:
+                mid_exit = True
+
+        if mid_exit == True:
+            print("will mid exit for long entry")
+            for i in range(len(prices)-(start_index+t5)):
+                if math.isnan(prices[start_index+t5+i, column_n_dict["sell_vwap"]]) == False:
+                    # ミッドとして、発注から最も近い未来のsell_vwapを採用する(要検討)
+                    # さらにコストを反映
+                    # ミッドとしていくらを採用するかが、厳密なシミュレーションの鍵となる
+                    mep = prices[start_index+t5+i, column_n_dict["sell_vwap"]] - mid_exit_cost
+                    prices[start_index, column_n_dict["pl"]] = (mep - buy_entry_price)*buy_entried_amount
+                    prices[start_index, column_n_dict["mid_exit"]] = True
+                    start_index += t5+t6+i
+                    vwap_all_nan = False
+                    print("mid long exit price : {}".format(mep))
+                    print("buy entry price : {}".format(buy_entry_price))
+                    print("alpha price : {}".format(mep-buy_entry_price))
+                    break
+            # t5後のデータにsell_vwapが一つも見つからなかった場合の対処
+            # if this is the case, you just assume that there is no trade i.e. pl = 0
+            if vwap_all_nan == True:
+                print("no sell taker exists")
+                prices[start_index, column_n_dict["pl"]] = 0
+                start_index += len(prices) - start_index
+
+
+
+    elif short_exit == True:
+        print("will short exit")
+        short_exit_price = sell_entry_price + bld_exit
+        print("sep : {}".format(short_exit_price))
+        try:
+            future_min_sell_price_exit = np.nanmax(prices[:,column_n_dict["sell_best_price"]][start_index+t2+t3:start_index+t2+t3+t4+1])
+        except:
+            future_min_sell_price_exit = np.nan
+        print("fminspexi : {}".format(future_min_sell_price_exit))
+        if short_exit_price > future_min_sell_price_exit:
+            print("exited")
+            a = sell[:,column_n_dict_sell["ts"]] >= prices[start_index+t2+t3, column_n_dict["ts"]]
+            b = sell[:,column_n_dict_sell["ts"]] <= prices[start_index+t2+t3+t4, column_n_dict["ts"]]
+            sell_scope = sell[a==b]
+            exitable_amount = sell_scope[sell_scope[:,column_n_dict_sell["price"]] < short_exit_price][:,column_n_dict_sell["quantity"]].sum()
+            print("exitable_amount : {}".format(exitable_amount))
+            if exitable_amount >= sell_entried_amount:
+                print("exited all")
+                # you exit all
+                prices[start_index, column_n_dict["pl"]] = sell_entried_amount*(sell_entry_price - short_exit_price)
+                start_index += t2+t3+t4+t6
+                print("start_index : {}".format(start_index))
+            elif exitable_amount < sell_entried_amount:
+                print("partial exit")
+                # you put limit exit order till your position is settled
+                prices[start_index, column_n_dict["pl"]] = exitable_amount*(sell_entry_price - short_exit_price)
+                sell_entried_amount = sell_entried_amount - exitable_amount
+                start_index += t2+t3+t4
+                print("start_index : {}".format(start_index))
+
+                if mid_exit_mode == False:
+
+                    while start_index+t3+t4 <= end_index:
+                        # use this price as index for exit though this is not real entry price
+                        short_exit_price = prices[start_index, column_n_dict["referred_buy_best_price"]] + bld_exit
+                        # to get away with loss cut
+                        if loss_cut == False:
+                            short_exit_price = min(short_exit_price, sell_entry_price + bld_exit)
+                        print("re entried")
+                        print("sep : {}".format(short_exit_price))
+                        try:
+                            future_min_sell_price_exit = np.nanmax(prices[:,column_n_dict["sell_best_price"]][start_index+t2+t3:start_index+t2+t3+t4+1])
+                        except:
+                            future_min_sell_price_exit = np.nan
+                        print("fminspexi : {}".format(future_min_sell_price_exit))
+                        if short_exit_price > future_min_sell_price_exit:
+                            print("exited")
+                            a = sell[:,column_n_dict_sell["ts"]] >= prices[start_index+t3, column_n_dict["ts"]]
+                            b = sell[:,column_n_dict_sell["ts"]] <= prices[start_index+t3+t4, column_n_dict["ts"]]
+                            sell_scope = sell[a==b]
+                            exitable_amount = sell_scope[sell_scope[:,column_n_dict_sell["price"]] < short_exit_price][:,column_n_dict_sell["quantity"]].sum()
+                            if exitable_amount >= sell_entried_amount:
+                                print("exited all")
+                                # you exit all
+                                prices[start_index, column_n_dict["pl"]] = sell_entried_amount*(sell_entry_price - short_exit_price)
+                                start_index += +t3+t4+t6
+                                print("start_index : {}".format(start_index))
+                                print("breaked")
+                                break
+                            elif exitable_amount < sell_entried_amount:
+                                print("partial exit")
+                                # you put limit exit order till your position is settled
+                                prices[start_index, column_n_dict["pl"]] = exitable_amount*(sell_entry_price - short_exit_price)
+                                sell_entried_amount = sell_entried_amount - exitable_amount
+                                start_index += +t3+t4
+                                print("start_index : {}".format(start_index))
+                        elif short_exit_price <= future_min_sell_price_exit:
+                            print("no exit")
+                            start_index += t3+t4
+                            print("start_index : {}".format(start_index))
+                        else:
+                            print("else and no exit")
+                            start_index += t3+t4
+                            print("start_index : {}".format(start_index))
+
+                elif mid_exit_mode == True:
+                    # partially filled
+                    mid_exit = True
+
+        elif short_exit_price <= future_min_sell_price_exit:
+            print("no exit")
+            start_index += t2+t3+t4
+            print("start_index : {}".format(start_index))
+
+            if mid_exit_mode == False:
+
+                while start_index+t3+t4 <= end_index:
+                    # use this price as index for exit though this is not real entry price
+                    short_exit_price = prices[start_index, column_n_dict["referred_buy_best_price"]] + bld_exit
+                    # to get away with loss cut
+                    if loss_cut == False:
+                        short_exit_price = min(short_exit_price, sell_entry_price + bld_exit)
+                    print("re entried")
+                    print("sep : {}".format(short_exit_price))
+                    try:
+                        future_min_sell_price_exit = np.nanmax(prices[:,column_n_dict["sell_best_price"]][start_index+t2+t3:start_index+t2+t3+t4+1])
+                    except:
+                        future_min_sell_price_exit = np.nan
+                    print("fminspexi : {}".format(future_min_sell_price_exit))
+                    if short_exit_price > future_min_sell_price_exit:
+                        print("exited")
+                        a = sell[:,column_n_dict_sell["ts"]] >= prices[start_index+t3, column_n_dict["ts"]]
+                        b = sell[:,column_n_dict_sell["ts"]] <= prices[start_index+t3+t4, column_n_dict["ts"]]
+                        sell_scope = sell[a==b]
+                        exitable_amount = sell_scope[sell_scope[:,column_n_dict_sell["price"]] < short_exit_price][:,column_n_dict_sell["quantity"]].sum()
+                        print("exitable_amount : {}".format(exitable_amount))
+                        if exitable_amount >= sell_entried_amount:
+                            print("exited all")
+                            # you exit all
+                            prices[start_index, column_n_dict["pl"]] = sell_entried_amount*(sell_entry_price - short_exit_price)
+                            start_index += +t3+t4+t6
+                            print("start_index : {}".format(start_index))
+                            print("breaked")
+                            break
+                        elif exitable_amount < sell_entried_amount:
+                            print("partial exit")
+                            # you put limit exit order till your position is settled
+                            prices[start_index, column_n_dict["pl"]] = exitable_amount*(sell_entry_price - short_exit_price)
+                            sell_entried_amount = sell_entried_amount - exitable_amount
+                            start_index += +t3+t4
+                            print("start_index : {}".format(start_index))
+                    elif short_exit_price <= future_min_sell_price_exit:
+                        print("no exit")
+                        start_index += t3+t4
+                        print("start_index : {}".format(start_index))
+                    else:
+                        print("else and no exit")
+                        start_index += t3+t4
+                        print("start_index : {}".format(start_index))
+
+            elif mid_exit_mode == True:
+                # there are trades done but did not reach exit level
+                mid_exit = True
+        else:
+            # you get here if there is no buy trades done while you wait to be filled and future_max_buy_price_exit is np.nan
+            if mid_exit_mode == False:
+                print("else and no exit")
+                start_index += t2+t3+t4
+                print("start_index : {}".format(start_index))
+            elif mid_exit_mode == True:
+                mid_exit = True
+
+        if mid_exit == True:
+            print("will mid exit for short entry")
+            for i in range(len(prices)-(start_index+t5)):
+                if math.isnan(prices[start_index+t5+i, column_n_dict["buy_vwap"]]) == False:
+                    # ミッドとして、発注から最も近い未来のsell_vwapを採用する(要検討)
+                    # さらにコストを反映
+                    # ミッドとしていくらを採用するかが、厳密なシミュレーションの鍵となる
+                    mep = prices[start_index+t5+i, column_n_dict["buy_vwap"]] + mid_exit_cost
+                    prices[start_index, column_n_dict["pl"]] = -1*(mep - sell_entry_price)*sell_entried_amount
+                    prices[start_index, column_n_dict["mid_exit"]] = True
+                    start_index += t5+t6+i
+                    vwap_all_nan = False
+                    print("mid short exit price : {}".format(mep))
+                    print("sell entry price : {}".format(sell_entry_price))
+                    print("alpha price : {}".format(-1*(mep - sell_entry_price)))
+                    print("start_index : {}".format(start_index))
+                    break
+            # t5後のデータにsell_vwapが一つも見つからなかった場合の対処
+            # if this is the case, you just assume that there is no trade i.e. pl = 0
+            if vwap_all_nan == True:
+                print("no buy taker exists")
+                prices[start_index, column_n_dict["pl"]] = 0
+                start_index += len(prices) - start_index
+
+    elif long_exit == False and short_exit == False:
+        # print("no entry")
+        # if no entry, you just cancel entry order and place entry order again
+        start_index += t2+t6
+        # print("start_index : {}".format(start_index))
+
+
+# エグジットできたデータのみを残す
+df_exit = pd.DataFrame(prices)
+df_exit.columns = columns
+
+exit_cnt = len(df_exit.dropna(subset = ["pl"]).reset_index(drop = False))
+mid_exit_cnt = df_exit["mid_exit"].sum()
+smart_exit_cnt = exit_cnt - mid_exit_cnt
+
+print("exit_cnt : {}".format(exit_cnt))
+print("exit_ratio : {}".format(exit_cnt/len(prices)))
+print("mid_exit_ratio : {}".format(mid_exit_cnt/exit_cnt))
+print("smart_exit_ratio : {}".format(smart_exit_cnt/exit_cnt))
+
+total_pl = df_exit["pl"].sum()
+print("total pl : {}".format(total_pl))
+print("total pl ratio : {}".format(total_pl/order_amount))
+
+plt.plot(df_exit["referred_buy_best_price"])
+plt.plot(df_exit["referred_sell_best_price"])
+plt.plot(df_exit["pl"].dropna())
+plt.plot(df_exit["pl"].fillna(0).cumsum())
+
+df_exit[df_exit["ts"] == df_exit.dropna(subset = ["pl"]).reset_index(drop = True).loc[0, "ts"]]
+
+# check micro market details on entry and exit(need to debug start_index calculation in optimazation algorithm though pl is calculated accurately)
+check_point = df_exit[df_exit["ts"] == df_exit.dropna(subset = ["pl"]).reset_index(drop = True).loc[0, "ts"]].index[0]
+df_exit[check_point-100:check_point+100]
+df_exit.dropna(subset = ["pl"])
+
+# check how it took time to entry
+df_exit = df_exit.dropna(subset = ["pl"]).reset_index(drop = True)
+
+df_exit["ts_diff"] = np.nan
+for i in range(len(df_exit)-1):
+    df_exit.loc[i+1, "ts_diff"] = df_exit.loc[i+1, "ts"] - df_exit.loc[i, "ts"]
+plt.hist(df_exit["ts_diff"])
