@@ -10,8 +10,6 @@ import copy
 
 ftx = ccxt.ftx()
 symbol = "ETH-PERP"
-fr_date = "2021-06-05"
-to_date = "2021-06-05"
 
 # インデックス取得から買い発注反映されるまでのレイテンシー
 t1 = 1
@@ -27,20 +25,8 @@ t5 = 5
 # 売り発注約定またはミッドヘッジ完了から、インデックス取得直前までのレイテンシー
 t6 = 3
 
-df_exe = pd.read_csv("executions_{0}_{1}.csv".format(symbol, fr_date), index_col = 0)
-tmp_date = fr_date
-# need to modify the code so that the code can handle data leaping months
-for i in range(int(to_date.split("-")[2]) - int(fr_date.split("-")[2])):
-    if int(tmp_date.split("-")[2]) < 10:
-        tmp_date = tmp_date.split("-")[0]+"-"+tmp_date.split("-")[1]+"-"+"0"+str(int(tmp_date.split("-")[2])+1)
-        print(tmp_date)
-    elif int(tmp_date.split("-")[2]) >= 10:
-        tmp_date = tmp_date.split("-")[0]+"-"+tmp_date.split("-")[1]+"-"+str(int(tmp_date.split("-")[2])+1)
-        print(tmp_date)
-    df_exe = pd.concat([df_exe, pd.read_csv("executions_{0}_{1}.csv".format(symbol, tmp_date), index_col = 0)]).reset_index(drop = True)
-
+df_exe = pd.read_csv("{}_executions.csv".format(symbol), index_col = 0)
 df_exe["ts"] = df_exe["time"].apply(lambda x : x[:26]).apply(lambda x : datetime.datetime.strptime(x, '%Y-%m-%dT%H:%M:%S.%f')).apply(lambda x : x.timestamp())
-# format standardization process(to convert format of FTX to Liquid)
 df_exe = df_exe.drop(["liquidation", "time"], axis = 1)
 df_exe = df_exe.rename(columns = {"size":"quantity", "side":"taker_side"})
 df_exe = df_exe.reindex(columns = ["ts", "id", "price", "quantity", "taker_side"])
